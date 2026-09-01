@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QQ 机器人托管平台</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- 登录/注册 -->
+  <div id="auth-view" class="auth-wrap hidden">
+    <div class="auth-card">
+      <h1>QQ 机器人托管平台</h1>
+      <p class="sub">注册后管理你自己的 QQ 机器人</p>
+      <div class="tabs">
+        <button id="tab-login" class="tab active">登录</button>
+        <button id="tab-register" class="tab">注册</button>
+      </div>
+      <form id="auth-form">
+        <label>用户名<input id="auth-username" type="text" placeholder="2~20 位字母/数字/中文" autocomplete="username"></label>
+        <label>密码<input id="auth-password" type="password" placeholder="至少 6 位" autocomplete="current-password"></label>
+        <button type="submit" id="auth-submit" class="btn primary">登录</button>
+      </form>
+      <p id="auth-msg" class="msg"></p>
+    </div>
+  </div>
+
+  <!-- 管理面板 -->
+  <div id="dashboard" class="dashboard hidden">
+    <header>
+      <div class="brand">QQ 机器人托管平台</div>
+      <div class="right">
+        <span id="who">未登录</span>
+        <button id="btn-logout" class="btn ghost">退出登录</button>
+      </div>
+    </header>
+    <main>
+      <div class="toolbar">
+        <h2>我的机器人</h2>
+        <button id="btn-new" class="btn primary">＋ 新建机器人</button>
+      </div>
+      <div id="bot-list" class="bot-list"></div>
+    </main>
+  </div>
+
+  <!-- 新建/编辑弹窗 -->
+  <div id="modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3 id="modal-title">新建机器人</h3>
+        <button id="modal-close" class="btn ghost">✕</button>
+      </div>
+      <form id="bot-form">
+        <div class="grid2">
+          <label>机器人名字<input name="name" type="text" placeholder="如：管理助手" required></label>
+          <label>QQ AppID（机器人ID）<input name="appId" type="text" placeholder="q.qq.com 开发设置里获取"></label>
+          <label>QQ AppSecret（机器人密钥）<input name="appSecret" type="password" placeholder="不填 = 保持原值"></label>
+          <label>AI 接口地址<input name="baseUrl" type="text" placeholder="https://api.deepseek.com"></label>
+          <label>AI API Key<input name="apiKey" type="password" placeholder="sk-..."></label>
+          <label>AI 模型<input name="model" type="text" placeholder="deepseek-chat"></label>
+        </div>
+        <label>机器人人设（角色提示词）<textarea name="persona" rows="5" placeholder="你是一个严肃、专业、可靠的 QQ 群管理机器人……"></textarea></label>
+        <label>机器人规定（群规，AI 会严格遵守）<textarea name="rules" rows="4" placeholder="1. 禁止色情低俗内容 2. 禁止广告……"></textarea></label>
+        <div class="field-label">特殊词语法（触发词 → 动作）</div>
+        <div id="words-list"></div>
+        <button type="button" id="btn-add-word" class="btn ghost">＋ 添加触发词</button>
+        <div class="field-label">群规审查</div>
+        <label class="inline"><input name="autoRebuke" type="checkbox" checked> 关键词自动注意</label>
+        <label>违规触发关键词（逗号分隔）<input name="keywords" type="text" placeholder="色情,黄图,约炮,裸聊,福利姬,性交,无码,艳照,色图,淫秽"></label>
+        <label class="inline"><input name="enabled" type="checkbox" checked> 启用该机器人</label>
+        <div class="modal-foot">
+          <button type="submit" class="btn primary">保存</button>
+          <button type="button" id="modal-cancel" class="btn ghost">取消</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

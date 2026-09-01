@@ -1,0 +1,456 @@
+/**
+ * 多机器人运行器（v0.3：完整功能对齐单机版）
+ * 每个用户的机器人是独立实例，具备：
+ *  - 人设(persona) + 机器人规定(rules) + 特殊词语法(specialWords)
+ *  - 完整指令：/帮助 /重置 /人格 /模型 /ping /查违规（含无斜杠、@前缀兼容）
+ *  - 群消息审计账本（每机器人独立持久化，供 /查违规）
+ *  - 色情关键词自动攻击（可配置）
+ *  - 对话记忆（每机器人独立持久化）
+ */
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  QQBot,
+  errorHandler,
+  mentionGate,
+  contentSanitizer,
+  messageFilter,
+  rateLimiter,
+} from "@tencent-connect/qqbot-nodejs";
+import { LlmClient } from "./llm.js";
+import { MemoryStore } from "./memory.js";
+import { GroupAuditLog } from "./audit.js";
+import { splitLongText, parseCommand } from "./utils.js";
+import { Bots } from "./store.js";
+
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const running = new Map(); // botId -> { instance, memory, llm, audit, status, lastError }
+
+// ---------------- 默认配置 ----------------
+const DEFAULT_PERSONA = [
+  "你是一个严肃、专业、可靠的 QQ 群管理机器人「管理助手」。",
+  "",
+  "行为准则：",
+  "- 语气正式、公事公办，回答简洁（1~4 句）",
+  "- 负责解答群规、维护群内秩序，遇到违规行为（色情、辱骂、广告、刷屏等）要正式警告并提醒群规",
+  "- 不闲聊、不卖萌、不玩梗，涉及群管理事务认真处理",
+  "- 有人询问管理规定时，结合「机器人规定」内容回答",
+  "- 始终使用中文，除非对方用其他语言",
+].join("\n");
+
+const DEFAULT_KEYWORDS = [
+  "色情", "黄图", "黄片", "黄站", "约炮", "嫖娼", "卖淫", "裸聊", "福利姬", "性交", "无码",
+  "艳照", "色图", "淫秽", "污秽", "三级片", "av资源", "av网址", "av女优", "成人网站", "性爱", "操逼", "肏", "鸡巴",
+];
+
+const REVIEWER_PROMPT = [
+  "你是一个 QQ 群的「群规风纪委员」，负责审查群聊消息记录是否违规。",
+  "违规类型（按严重程度排序，从严判定）：",
+  "1. 色情：色情、低俗、性暗示、约炮、淫秽资源等内容（重点打击，最严重，发现即定级「高」）",
+  "2. 违法/不实信息：谣言、诈骗、违法违规、危害社会的内容（重点打击，最严重，发现即定级「高」）",
+  "3. 辱骂：脏话、人身攻击、侮辱性言论",
+  "4. 广告：广告推销、引流链接、加群广告",
+  "5. 刷屏/无意义灌水：同一人短时间内连续大量重复或无意义消息",
+  "6. 其他违规：引战、敏感内容等",
+  "规则：",
+  "- 色情、违法/不实信息一经发现，severity 一律标「高」",
+  "- 只报告证据确凿的违规，模棱两可的不算",
+  "- evidence 引用原话，不超过 30 字",
+  "- 输出必须是 JSON，格式：",
+  '{"violations":[{"type":"色情","user":"昵称","evidence":"原话摘要","severity":"高"}],"summary":"一句话总结"}',
+  '- 没有违规时输出 {"violations":[],"summary":"今日群内未发现违规内容"}',
+].join("\n");
+
+const REBUKES = [
+  "喂喂喂，公共场合能不能管管自己？脑子里的黄色废料都漏出来了，这条我记小本本上了！😒",
+  "啧，群规第一条：黄色内容禁止外泄。说的就是你，收敛点，再犯直接点名公示！",
+  "请你立刻停下！本群不是法外之地，再发这种内容，我就把你今天的所作所为整理成大字报发群里。",
+];
+
+const BARE_COMMAND_WORDS = new Set([
+  "help", "帮助", "菜单",
+  "reset", "重置", "清空",
+  "persona", "人格", "人设",
+  "model", "模型",
+  "ping",
+  "check", "查违规", "违规检查", "群规检查", "公示",
+]);
+
+export function defaultBotRecord(ownerId, name = "我的机器人") {
+  return {
+    id: null,
+    ownerId,
+    name,
+    enabled: true,
+    status: "stopped",
+    lastError: "",
+    qq: { appId: "", appSecret: "" },
+    llm: { baseUrl: "https://api.deepseek.com", apiKey: "", model: "deepseek-chat", temperature: 0.7 },
+    persona: DEFAULT_PERSONA,
+    rules: "",
+    specialWords: [], // [{ word, action: "reply"|"ai"|"ignore", reply?, prompt? }]
+    moderation: { enabled: true, autoRebuke: true, cooldownMinutes: 5, keywords: [...DEFAULT_KEYWORDS] },
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+}
+
+function makeLogger(botId, prefix) {
+  const stamp = () => new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  return {
+    info: (m) => console.log(`[${stamp()}] [${prefix}:${botId}] ℹ️  ${m}`),
+    warn: (m) => console.log(`[${stamp()}] [${prefix}:${botId}] ⚠️  ${m}`),
+    error: (m) => console.error(`[${stamp()}] [${prefix}:${botId}] ❌ ${m}`),
+    debug: () => {},
+  };
+}
+
+function buildSystemPrompt(record) {
+  const parts = [record.persona || DEFAULT_PERSONA];
+  if (record.rules && String(record.rules).trim()) {
+    parts.push("\n## 机器人规定（必须严格遵守）\n" + String(record.rules).trim());
+  }
+  return parts.join("\n");
+}
+
+function matchSpecialWord(record, text) {
+  const words = Array.isArray(record.specialWords) ? record.specialWords : [];
+  for (const item of words) {
+    const w = String(item?.word ?? "").trim();
+    if (!w) continue;
+    if (text.includes(w)) return item;
+  }
+  return null;
+}
+
+function matchPornKeywords(moderation, content) {
+  if (!moderation?.enabled || !moderation?.autoRebuke) return false;
+  const keywords = Array.isArray(moderation.keywords) ? moderation.keywords : [];
+  if (keywords.length === 0) return false;
+  const text = String(content ?? "").toLowerCase();
+  return keywords.some((kw) => text.includes(String(kw).toLowerCase()));
+}
+
+async function safeSend(bot, target, content) {
+  try {
+    await bot.sendText(target, content);
+  } catch {}
+}
+
+export async function startBot(botId) {
+  if (running.has(botId)) return { status: "running", lastError: "" };
+  const record = Bots.findWithSecrets(botId);
+  if (!record) throw new Error("机器人不存在");
+
+  const problems = [];
+  if (!record.qq?.appId) problems.push("QQ AppID 未填写");
+  if (!record.qq?.appSecret) problems.push("QQ AppSecret 未填写");
+  if (!record.llm?.apiKey && !/localhost|127\.0\.0\.1/.test(record.llm?.baseUrl ?? "")) problems.push("AI API Key 未填写");
+  if (problems.length > 0) {
+    const err = "启动前检查未通过：" + problems.join("；");
+    Bots.update(botId, { status: "error", lastError: err });
+    return { status: "error", lastError: err };
+  }
+
+  const log = makeLogger(botId, record.name);
+  const moderation = {
+    enabled: record.moderation?.enabled !== false,
+    autoRebuke: record.moderation?.autoRebuke !== false,
+    cooldownMs: (record.moderation?.cooldownMinutes ?? 5) * 60 * 1000,
+    keywords: Array.isArray(record.moderation?.keywords) ? record.moderation.keywords : [],
+  };
+  const memory = new MemoryStore({
+    maxTurns: 12,
+    ttlMs: 3 * 60 * 60 * 1000,
+    persist: true,
+    filePath: path.join(ROOT, "data", "memories", botId + ".json"),
+    logger: log,
+  });
+  const audit = new GroupAuditLog({
+    filePath: path.join(ROOT, "data", "audits", botId + ".json"),
+    keepDays: 3,
+    maxPerGroupPerDay: 2000,
+    logger: log,
+  });
+  const llm = new LlmClient(record.llm ?? {}, log);
+  const bot = new QQBot({ appId: record.qq.appId, appSecret: record.qq.appSecret, logger: log });
+  const systemPrompt = buildSystemPrompt(record);
+
+  const helpText = [
+    `${record.name} · 指令列表`,
+    "——————————",
+    "/帮助   查看本说明",
+    "/重置   清空和你的对话记忆",
+    "/人格   查看当前人设",
+    "/模型   查看当前 AI 模型",
+    "/ping   检查机器人状态",
+    "/查违规 审查今天群内消息并公示（仅群聊）",
+    "提示：指令不带 / 也能用，直接发「查违规」即可",
+  ].join("\n");
+
+  const lastRebukeAt = new Map(); // groupId -> ts
+  const lastCheckAt = new Map(); // groupId -> ts
+
+  // ---- 中间件 ----
+  bot.use(errorHandler({ format: (err) => `⚠️ 处理消息时出错：${String(err?.message ?? err).slice(0, 120)}` }));
+  bot.use(async (ctx, next) => {
+    const m = ctx.message;
+    if (m.kind === "group" && m.groupOpenid) {
+      audit.record(m.groupOpenid, {
+        senderId: m.senderId,
+        senderName: m.senderName,
+        content: m.content,
+        isAt: m.rawEventType === "GROUP_AT_MESSAGE_CREATE",
+        isBot: m.senderIsBot,
+      });
+    }
+    await next();
+    // 色情关键词自动攻击（仅针对未被 @ 的群消息，避免重复回复）
+    const msg = ctx.message;
+    if (msg.kind === "group" && msg.groupOpenid && !msg.senderIsBot) {
+      if (ctx.state?.mention?.shouldAnswer) return;
+      if (!matchPornKeywords(moderation, msg.content)) return;
+      const now = Date.now();
+      const last = lastRebukeAt.get(msg.groupOpenid) ?? 0;
+      if (now - last < moderation.cooldownMs) return;
+      lastRebukeAt.set(msg.groupOpenid, now);
+      await safeSend(bot, msg.replyTarget, REBUKES[Math.floor(Math.random() * REBUKES.length)]);
+    }
+  });
+  bot.use(messageFilter({ skipSelfEcho: true }));
+  bot.use(rateLimiter({ perSender: { max: 8, windowMs: 60_000 }, global: { max: 120, windowMs: 60_000 } }));
+  bot.use(mentionGate({ requireMentionInGroup: true }));
+  bot.use(contentSanitizer({ stripBotMention: true, stripAllMentions: true, transform: (c) => c.replace(/<@[^>]*>/g, "") }));
+
+  // ---- 事件 ----
+  bot.on("ready", () => {
+    running.set(botId, { ...running.get(botId), status: "running", lastError: "" });
+    Bots.update(botId, { status: "running", lastError: "" });
+    log.info("✅ 已连接 QQ 开放平台");
+  });
+  bot.on("error", (err) => {
+    const msg = String(err?.message ?? err).slice(0, 200);
+    log.error("网关错误：" + msg);
+    Bots.update(botId, { status: "error", lastError: msg });
+  });
+
+  bot.on("message", async (ctx, msg) => {
+    const text = String(msg.content ?? "").trim().replace(/^(?:@[^\s@]+\s*)+/, "").trim();
+    if (!text) return;
+    const target = msg.replyTarget;
+    const key = MemoryStore.sessionKey(target.scope, target.targetId, msg.senderId);
+
+    // ---- 指令 ----
+    const cmd = parseCommand(text);
+    if (cmd && (await handleCommand(ctx, msg, cmd))) return;
+    const bareWord = text.replace(/^[\/／]\s*/, "").toLowerCase();
+    if (BARE_COMMAND_WORDS.has(bareWord) && !/\s/.test(bareWord)) {
+      if (await handleCommand(ctx, msg, { name: bareWord, args: "" })) return;
+    }
+    if (/^[\/／]/.test(text)) {
+      await safeSend(bot, target, "❓ 未知指令「" + text.slice(0, 24) + "」。发送 /帮助 查看全部指令。");
+      return;
+    }
+
+    // ---- 特殊词语法 ----
+    const hit = matchSpecialWord(record, text);
+    let aiPrompt = "";
+    if (hit) {
+      if (hit.action === "reply" && String(hit.reply ?? "").trim()) {
+        await safeSend(bot, target, String(hit.reply).trim());
+        return;
+      }
+      if (hit.action === "ignore") return;
+      if (hit.action === "ai" && String(hit.prompt ?? "").trim()) {
+        aiPrompt = String(hit.prompt).trim(); // 交给 AI：提示词参与判断，AI 自行回答
+      }
+    }
+
+    // ---- AI 回答 ----
+    const history = memory.get(key);
+    const messages = [{ role: "system", content: systemPrompt }];
+    if (aiPrompt) messages.push({ role: "system", content: "【本轮特殊指令】" + aiPrompt });
+    messages.push(...history, { role: "user", content: text });
+
+    if (target.scope === "c2c") {
+      try { await bot.sendTyping(target, 60); } catch {}
+    }
+    let reply;
+    try {
+      reply = await llm.chat(messages, { signal: ctx.signal });
+    } catch (err) {
+      log.error("AI 调用失败：" + err?.message);
+      await safeSend(bot, target, "AI 服务暂时不可用，请稍后再试。");
+      return;
+    }
+    reply = String(reply ?? "").trim();
+    if (!reply) return;
+    memory.push(key, "user", text);
+    memory.push(key, "assistant", reply);
+    for (const chunk of splitLongText(reply, 2000)) {
+      if (ctx.signal?.aborted) break;
+      await safeSend(bot, target, chunk);
+    }
+  });
+
+  // ---- 指令处理 ----
+  async function handleCommand(ctx, msg, cmd) {
+    const { name } = cmd;
+    switch (name) {
+      case "help":
+      case "帮助":
+      case "菜单": {
+        await safeSend(bot, msg.replyTarget, helpText);
+        return true;
+      }
+      case "reset":
+      case "重置":
+      case "清空": {
+        const k = MemoryStore.sessionKey(msg.replyTarget.scope, msg.replyTarget.targetId, msg.senderId);
+        memory.clear(k);
+        await safeSend(bot, msg.replyTarget, "🧹 已清空我们之间的对话记忆。");
+        return true;
+      }
+      case "persona":
+      case "人格":
+      case "人设": {
+        const snippet = systemPrompt.length > 600 ? systemPrompt.slice(0, 600) + "\n……" : systemPrompt;
+        await safeSend(bot, msg.replyTarget, "🎭 当前人设与规定：\n" + snippet);
+        return true;
+      }
+      case "model":
+      case "模型": {
+        await safeSend(bot, msg.replyTarget, `🧠 当前 AI 模型：${record.llm?.model ?? "未配置"}（${record.llm?.baseUrl ?? ""}）`);
+        return true;
+      }
+      case "ping": {
+        await safeSend(bot, msg.replyTarget, "🟢 机器人运行正常！");
+        return true;
+      }
+      case "check":
+      case "查违规":
+      case "违规检查":
+      case "群规检查":
+      case "公示": {
+        await runAuditCheck(ctx, msg);
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
+  // ---- /查违规 ----
+  async function runAuditCheck(ctx, msg) {
+    const target = msg.replyTarget;
+    if (target.scope !== "group") {
+      await safeSend(bot, target, "这个指令只能在群里使用。");
+      return;
+    }
+    const groupId = target.targetId;
+    const now = Date.now();
+    const last = lastCheckAt.get(groupId) ?? 0;
+    if (now - last < 2 * 60 * 1000) {
+      await safeSend(bot, target, "别催啦，审查也要时间的～ 2 分钟后再来。");
+      return;
+    }
+    lastCheckAt.set(groupId, now);
+
+    const entries = audit.getToday(groupId);
+    if (entries.length === 0) {
+      await safeSend(bot, target, "📋 今天还没有收到任何群消息记录。\n（注：未开通全量消息时只能看到 @机器人 的消息）");
+      return;
+    }
+    const recent = entries.slice(-400);
+    const recordText = recent.map((e) => `[${e.t}] ${e.user}: ${e.content}`).join("\n");
+    await safeSend(bot, target, `🔍 正在审查今天的 ${entries.length} 条群消息记录，稍等…`);
+
+    let verdict;
+    try {
+      verdict = await llm.chat(
+        [
+          { role: "system", content: REVIEWER_PROMPT },
+          { role: "user", content: `以下是今天的群聊消息记录（${recent.length} 条）：\n${recordText}` },
+        ],
+        { signal: ctx.signal },
+      );
+    } catch (err) {
+      log.error("群规审查失败：" + err?.message);
+      await safeSend(bot, target, "审查服务出错了，请稍后再试。");
+      return;
+    }
+
+    const report = renderReport(verdict, entries.length, groupId);
+    for (const chunk of splitLongText(report, 2000)) {
+      if (ctx.signal?.aborted) break;
+      await safeSend(bot, target, chunk);
+    }
+  }
+
+  function renderReport(verdictText, totalCount, groupId) {
+    let parsed = null;
+    const raw = String(verdictText ?? "").trim();
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      try { parsed = JSON.parse(jsonMatch[0]); } catch {}
+    }
+    const time = new Date().toLocaleString("zh-CN", { hour12: false });
+    const lines = [];
+    lines.push("📋 今日群规检查报告");
+    lines.push(`⏱ 检查时间：${time}　收录消息：${totalCount} 条`);
+    lines.push("——————————");
+    if (parsed && Array.isArray(parsed.violations)) {
+      const v = parsed.violations;
+      if (v.length === 0) {
+        lines.push("✅ 未发现违规内容，群风良好～");
+      } else {
+        lines.push(`⚠️ 发现 ${v.length} 条疑似违规：`);
+        v.forEach((item, i) => {
+          lines.push(`${i + 1}.【${item?.type ?? "违规"}·${item?.severity ?? "中"}】${item?.user ?? "未知"}：「${item?.evidence ?? ""}」`);
+        });
+        if (parsed.summary) lines.push(`💬 总结：${parsed.summary}`);
+      }
+    } else {
+      lines.push(raw.slice(0, 1500) || "（审查结果为空）");
+    }
+    if (audit.todayAllAt(groupId)) {
+      lines.push("——————————");
+      lines.push("⚠️ 提示：今天只收到了 @机器人 的消息记录。想监控全群，请在手机 QQ 群设置里开启「获取群内全部消息」。");
+    }
+    return lines.join("\n");
+  }
+
+  running.set(botId, { instance: bot, memory, llm, audit, status: "starting", lastError: "" });
+  Bots.update(botId, { status: "starting", lastError: "" });
+
+  bot.start().catch((err) => {
+    const msg = String(err?.message ?? err).slice(0, 200);
+    running.set(botId, { ...running.get(botId), status: "error", lastError: msg });
+    Bots.update(botId, { status: "error", lastError: msg });
+    log.error("启动失败：" + msg);
+  });
+
+  return { status: "starting", lastError: "" };
+}
+
+export async function stopBot(botId) {
+  const entry = running.get(botId);
+  if (!entry) {
+    Bots.update(botId, { status: "stopped", lastError: "" });
+    return { status: "stopped" };
+  }
+  try { entry.instance?.stop(); } catch {}
+  entry.memory?.flush();
+  entry.audit?.flush();
+  running.delete(botId);
+  Bots.update(botId, { status: "stopped", lastError: "" });
+  return { status: "stopped" };
+}
+
+export function getStatus(botId) {
+  return running.has(botId) ? running.get(botId).status : "stopped";
+}
+
+export function runningCount() {
+  return running.size;
+}
