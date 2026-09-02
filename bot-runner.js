@@ -86,6 +86,7 @@ const BARE_COMMAND_WORDS = new Set([
   "model", "模型",
   "ping",
   "check", "查违规", "违规检查", "群规检查", "公示",
+  "analysis", "分析", "群分析", "建议", "群建议",
 ]);
 
 export function defaultBotRecord(ownerId, name = "我的机器人") {
@@ -265,16 +266,29 @@ export async function startBot(botId) {
       return { ok: false, reason: msg };
     }
   }
+  function normalizeForMatch(s) {
+    return String(s ?? "")
+      .replace(/\s+/g, "")
+      .replace(/[，。！？!?,.、:：;；"'""''【】\[\]()（）…—\-_]/g, "");
+  }
   function findEntryByEvidence(entries, evidence) {
-    const ev = String(evidence ?? "").trim();
+    const ev = normalizeForMatch(evidence);
     if (!ev) return null;
     for (const e of entries) {
-      if (e.content.includes(ev)) return e;
+      if (normalizeForMatch(e.content).includes(ev)) return e;
     }
     for (const e of entries) {
-      if (e.content.length >= 6 && ev.includes(e.content)) return e;
+      const nc = normalizeForMatch(e.content);
+      if (nc.length >= 10 && ev.includes(nc)) return e;
     }
     return null;
+  }
+  // 按人结清：该用户这批发言全部标记为已处罚，之后不再因这些言论重复禁言
+  function markPunishedForUser(uid, reviewedEntries) {
+    const ids = reviewedEntries
+      .filter((e) => e.uid === uid && !isPunished(e.id))
+      .map((e) => e.id);
+    markPunished(ids);
   }
 
   const helpText = [
@@ -286,6 +300,7 @@ export async function startBot(botId) {
     "/模型   查看当前 AI 模型",
     "/ping   检查机器人状态",
     "/查违规 审查今天群内消息并公示（仅群聊）",
+    "/群分析 结合人设与群规分析今日群聊，给出管理建议（仅群聊）",
     "提示：指令不带 / 也能用，直接发「查违规」即可",
   ].join("\n");
 
@@ -453,6 +468,14 @@ export async function startBot(botId) {
         await runAuditCheck(ctx, msg);
         return true;
       }
+      case "analysis":
+      case "分析":
+      case "群分析":
+      case "建议":
+      case "群建议": {
+        await runGroupAnalysis(ctx, msg);
+        return true;
+      }
       default:
         return false;
     }
@@ -521,7 +544,7 @@ export async function startBot(botId) {
       for (const [uid, info] of muted) {
         if (!canMute(groupId, uid)) continue; // 60 秒冷却，防并发重复
         const r = await muteMember(groupId, uid, info.durMs);
-        if (r.ok) markPunished(info.ids);
+        if (r.ok) markPunishedForUser(uid, entries); // 该人今日截至现在的发言全部结清
         muteResults.push({ uid, durMs: info.durMs, ...r });
       }
     }
@@ -618,7 +641,7 @@ export async function startBot(botId) {
         if (!canMute(groupId, uid)) continue;
         const r = await muteMember(groupId, uid, info.durMs);
         if (r.ok) {
-          markPunished(info.ids);
+          markPunishedForUser(uid, entries);
           log.info(`主动检查：已禁言 ${uid} ${Math.round(info.durMs / 60000)} 分钟`);
         } else {
           log.warn(`主动检查禁言失败：${String(r.reason).slice(0, 100)}`);
@@ -633,6 +656,65 @@ export async function startBot(botId) {
     );
     scanTimer.unref?.();
     log.info(`主动检查已开启：每 ${autoMute.scanIntervalMinutes} 分钟审查一次最近消息`);
+  }
+
+  // ---- /群分析：结合人设与规定（知识库）分析今日群聊并给出建议 ----
+  const lastAnalysisAt = new Map(); // groupId -> ts
+  async function runGroupAnalysis(ctx, msg) {
+    const target = msg.replyTarget;
+    if (target.scope !== "group") {
+      await safeSend(bot, target, "这个指令只能在群里使用。");
+      return;
+    }
+    const groupId = target.targetId;
+    const now = Date.now();
+    if (now - (lastAnalysisAt.get(groupId) ?? 0) < 2 * 60 * 1000) {
+      await safeSend(bot, target, "分析也要时间的～ 2 分钟后再来。");
+      return;
+    }
+    lastAnalysisAt.set(groupId, now);
+
+    const entries = audit.getToday(groupId);
+    if (entries.length === 0) {
+      await safeSend(bot, target, "📋 今天还没有收到任何群消息记录，没法分析。");
+      return;
+    }
+    const recent = entries.slice(-400);
+    const recordText = recent.map((e) => `[${e.t}] ${e.user}: ${e.content}`).join("\n");
+    await safeSend(bot, target, `🧠 正在结合人设与群规分析今天的 ${entries.length} 条消息，稍等…`);
+
+    const ANALYSIS_TASK = [
+      "请阅读今天的群聊记录，结合你的「人设」与「机器人规定」（这是你的知识库），输出一份《今日群况分析与建议》：",
+      "1. 群活跃度与主要话题",
+      "2. 群风与氛围评价",
+      "3. 潜在风险与违规苗头",
+      "4. 结合群规给出 3~5 条具体、可执行的管理建议",
+      "要求：语气与你的角色一致；分点简洁；建议必须贴合本群的「机器人规定」，不要泛泛而谈。",
+    ].join("\n");
+
+    let reply;
+    try {
+      reply = await llm.chat(
+        [
+          { role: "system", content: systemPrompt + "\n\n## 当前任务：群聊分析\n" + ANALYSIS_TASK },
+          { role: "user", content: `以下是今天的群聊消息记录（${recent.length} 条）：\n${recordText}` },
+        ],
+        { signal: ctx.signal },
+      );
+    } catch (err) {
+      log.error("群分析失败：" + err?.message);
+      await safeSend(bot, target, "分析服务出错了，请稍后再试。");
+      return;
+    }
+    const textOut = String(reply ?? "").trim();
+    if (!textOut) {
+      await safeSend(bot, target, "没分析出内容，换个时间再试试。");
+      return;
+    }
+    for (const chunk of splitLongText(textOut, 2000)) {
+      if (ctx.signal?.aborted) break;
+      await safeSend(bot, target, chunk);
+    }
   }
 
   running.set(botId, { instance: bot, memory, llm, audit, scanTimer, savePunished, status: "starting", lastError: "" });
