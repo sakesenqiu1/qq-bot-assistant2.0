@@ -44,6 +44,10 @@ export class GroupAuditLog {
     return h.toString(16).padStart(4, "0").slice(0, 4);
   }
 
+  static genId() {
+    return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+  }
+
   /** 清洗消息文本：去 @ 标记、表情标签、多余空白，限长。 */
   static cleanContent(content) {
     let text = String(content ?? "")
@@ -73,7 +77,7 @@ export class GroupAuditLog {
       days.set(day, list);
     }
     const entry = {
-      id: now.toString(36) + "-" + Math.random().toString(36).slice(2, 8),
+      id: GroupAuditLog.genId(),
       t: GroupAuditLog.timeKey(now),
       ts: now,
       user: senderName || "匿名群友#" + GroupAuditLog.hashId(senderId),
@@ -140,13 +144,23 @@ export class GroupAuditLog {
   load() {
     if (!existsSync(this.filePath)) return;
     const raw = JSON.parse(readFileSync(this.filePath, "utf8"));
+    let backfilled = false;
     for (const [groupId, dayObj] of Object.entries(raw)) {
       const days = new Map();
       for (const [day, list] of Object.entries(dayObj ?? {})) {
-        if (Array.isArray(list)) days.set(day, list);
+        if (!Array.isArray(list)) continue;
+        // 兼容旧数据：补条目唯一 id（去重依赖它）
+        for (const entry of list) {
+          if (!entry || !entry.id) {
+            if (entry) entry.id = GroupAuditLog.genId();
+            backfilled = true;
+          }
+        }
+        days.set(day, list);
       }
       if (days.size > 0) this.groups.set(groupId, days);
     }
     this.prune();
+    if (backfilled) this.scheduleSave(); // 把补上的 id 写回磁盘
   }
 }
