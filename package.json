@@ -1,6 +1,6 @@
 {
   "name": "qq-bot-platform",
-  "version": "0.1.0",
+  "version": "0.7.0",
   "description": "QQ 机器人托管平台（本地空白版）：多用户注册，各自管理自己的 QQ 机器人配置",
   "private": true,
   "type": "module",

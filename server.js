@@ -1,5 +1,5 @@
 /**
- * QQ 机器人托管平台 - 后端 API（v0.2）
+ * QQ 机器人托管平台 - 后端 API（v0.7）
  * 更新：SQLite 存储（node:sqlite）+ 敏感字段 AES-256-GCM 加密 + 可选 HTTPS
  * 提供：注册/登录、机器人增删改查、启动/停止、前端静态页面
  */
@@ -260,7 +260,7 @@ const useHttps = existsSync(keyFile) && existsSync(crtFile);
 
 function banner() {
   console.log("============================================");
-  console.log("  QQ 机器人托管平台（本地版 v0.3）");
+  console.log("  QQ 机器人托管平台（v0.7 · 服务器版）");
   console.log("============================================");
   if (useHttps) {
     console.log(`  ✔ HTTPS 已启用：https://localhost:${PORT}`);

@@ -1,10 +1,10 @@
 /**
- * 多机器人运行器（v0.3：完整功能对齐单机版）
+ * 多机器人运行器（v0.7）
  * 每个用户的机器人是独立实例，具备：
  *  - 人设(persona) + 机器人规定(rules) + 特殊词语法(specialWords)
  *  - 完整指令：/帮助 /重置 /人格 /模型 /ping /查违规（含无斜杠、@前缀兼容）
  *  - 群消息审计账本（每机器人独立持久化，供 /查违规）
- *  - 色情关键词自动攻击（可配置）
+ *  - 关键词自动注意 + 自动禁言（三级力度）+ 主动检查（可配置）
  *  - 对话记忆（每机器人独立持久化）
  */
 import path from "node:path";
@@ -342,7 +342,7 @@ export async function startBot(botId) {
       });
     }
     await next();
-    // 色情关键词自动攻击（仅针对未被 @ 的群消息，避免重复回复）
+    // 关键词自动注意（仅针对未被 @ 的群消息，避免重复回复）
     const msg = ctx.message;
     if (msg.kind === "group" && msg.groupOpenid && !msg.senderIsBot) {
       if (ctx.state?.mention?.shouldAnswer) return;
