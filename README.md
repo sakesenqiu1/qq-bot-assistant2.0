@@ -1,24 +1,46 @@
-# QQ 机器人托管平台（本地版 v0.4）
+# QQ 机器人托管平台（v0.4 · 服务器版）
 
 把 QQ 机器人"变成服务"：**用户注册后，在网页上填自己的 QQ 机器人凭证、AI 配置、人设、规定、特殊词语法，即可增删改查并一键启动/停止自己的机器人**。每个用户的机器人是独立实例（官方 SDK 多实例架构）。
 
-> 状态：本地版 v0.3（运行在自己电脑上，未部署到任何服务器）
-> 版本历史：v0.2 SQLite + 密钥加密 + HTTPS ｜ v0.3 功能对齐单机版（完整指令 + 群规审查）｜ **v0.4 自动禁言**
+> 版本历史：v0.2 SQLite + 密钥加密 + HTTPS ｜ v0.3 功能对齐单机版（完整指令 + 群规审查）｜ v0.4 自动禁言（三级力度 + 严重罪行定义）
 
-## 快速开始
+## 服务器部署（推荐，约 5 分钟）
 
-1. 双击 `start.bat`（首次自动安装依赖）
-2. 浏览器打开 **http://localhost:3000**（启用 HTTPS 后为 https://localhost:3000）
-3. 注册账号 → 登录 → 「＋ 新建机器人」
-4. 填写：
-   - **机器人名字**、**QQ AppID / AppSecret**（用户自己到 q.qq.com 注册获取）
-   - **AI 接口地址 / API Key / 模型**（DeepSeek 等 OpenAI 兼容接口，用户自带 Key）
-   - **机器人人设**（角色提示词）、**机器人规定**（群规，AI 严格遵守）
-   - **特殊词语法**（触发词 → 动作，见下）
-   - **群规审查**（色情关键词自动攻击开关 + 关键词列表）
-5. 点「启动」→ 状态变「运行中」→ 用手机 QQ 和机器人聊天
+**要求**：Linux x64 服务器（root 权限）、一个已解析到该服务器的域名、安全组放行 80/443。
 
-## 完整功能（v0.3 已对齐单机版）
+```bash
+# 1. 上传/克隆本项目到服务器，例如 /root/qq-bot-platform
+git clone https://github.com/sakesenqiu1/qq-bot-assistant2.0.git /root/qq-bot-platform
+
+# 2. 一键部署（自动完成：Node 24 → 依赖 → Let's Encrypt 证书 → nginx 反代 → systemd 服务）
+cd /root/qq-bot-platform
+sudo bash deploy/setup-server.sh
+```
+
+脚本会：
+1. 检查/安装 **Node.js 24+**（平台依赖内置 node:sqlite）
+2. 安装 npm 依赖（npmmirror 源）
+3. 交互式询问域名 → 用 acme.sh 签发 **Let's Encrypt 正式证书**（自动续期，续期后自动 reload nginx）
+4. 生成 nginx 反代配置（80 → 443 跳转，TLS 终止，转发本机 3000）
+5. 安装 systemd 服务 `qqbot-platform`（**开机自启 + 崩溃自动重启**）
+6. 启动并输出访问地址
+
+部署完成后打开 `https://你的域名` → 注册 → 新建机器人 → 填 QQ 凭证与 AI 配置 → 启动。
+
+### 已部署示例
+
+- https://ai.翼起风落.site （中文域名以 punycode 形式配置：`ai.xn--qw0a20gp5j1xl.site`）
+
+## 本地开发运行（可选）
+
+```bash
+npm install --registry=https://registry.npmmirror.com
+npm start                # http://localhost:3000
+```
+
+Windows 用户可双击 `start.bat`；需要本地 HTTPS 时运行 `make-cert.bat`（自签名证书，仅本机调试用）。服务器部署请使用正式证书（见上）。
+
+## 完整功能（v0.4）
 
 ### 内置指令（每个机器人都有）
 | 指令 | 作用 |
@@ -36,12 +58,12 @@
 | 动作 | 第三个输入框填什么 |
 |---|---|
 | 固定回复 | 回复文本（原样发出） |
-| **交给AI判断** | **给 AI 的提示词**：AI 按该提示词自行判断并回答（如"用户可能涉及辱骂，请判断并严肃警告"） |
+| 交给AI判断 | 给 AI 的提示词：AI 按该提示词自行判断并回答 |
 | 忽略 | 不填（命中后不回复） |
 
 ### 群规审查
 - **关键词自动注意**：群内出现违规关键词自动毒舌警告（每群 5 分钟一次，关键词可自定义）
-- **自动禁言（可选开关）**：按「禁言力度」对违规者执行禁言，三种力度：
+- **自动禁言（可选开关）**：按「禁言力度」对违规者执行禁言，三档：
 
 | 力度 | 一般违规 | 严重罪行 |
 |---|---|---|
@@ -50,16 +72,11 @@
 | 重度（顶格） | 禁言 1 小时 | 禁言 24 小时 |
 
 - **严重罪行定义**：色情类、违法/不实信息类违规（或审查定级「高」）
-- 触发时机：① `/查违规` 审查出违规后自动执行，报告公示禁言结果；② 关键词命中（按严重罪行处理）
-- 平台要求：机器人需在群内拥有**管理员身份**才能禁言；群主/管理员不可被禁言（平台限制）
-- **/查违规**：AI 按「色情（重点）/ 违法不实（重点）/ 辱骂 / 广告 / 刷屏 / 其他」审查今天的群消息记录并公示，报告含涉事人、类型、严重度、原话摘要
-- 每机器人独立审计账本（`data/audits/<机器人ID>.json`，保留 3 天），对话记忆独立持久化（`data/memories/`）
+- 触发时机：① `/查违规` 审查出违规后自动执行并在报告公示；② 关键词命中（按严重罪行处理）
+- 平台要求：机器人需在群内拥有**管理员身份**才能禁言；群主/管理员不可被禁言
+- **/查违规**：AI 按「色情（重点）/ 违法不实（重点）/ 辱骂 / 广告 / 刷屏 / 其他」审查今天的群消息记录并公示
+- 每机器人独立审计账本（`data/audits/`，保留 3 天），对话记忆独立持久化（`data/memories/`）
 - 注意：平台默认只推送 `@机器人` 的消息；想覆盖全群，需在手机 QQ 群设置开启「获取群内全部消息」
-
-## 启用 HTTPS（推荐）
-
-双击 `make-cert.bat` 生成自签名证书 → 重启 `start.bat` → 用 **https://localhost:3000** 访问。
-浏览器提示"不安全"是自签名证书的正常现象（本机开发用），点"高级 → 继续访问"。上线部署时换成正式证书（Let's Encrypt 等）。
 
 ## 安全设计
 
@@ -67,27 +84,30 @@
 |---|---|
 | 存储 | SQLite（Node 内置 node:sqlite，需 Node 24+），文件 `data/db.sqlite` |
 | 密钥加密 | 用户的 AppSecret / API Key 用 **AES-256-GCM** 加密后落库，主密钥在 `data/master.key` |
-| 密钥隔离 | API **永不返回**密钥原文，只返回 `hasSecret/hasKey`；编辑留空 = 保持原密钥 |
+| 密钥隔离 | API 永不返回密钥原文，只返回 `hasSecret/hasKey`；编辑留空 = 保持原密钥 |
 | 密码 | scrypt 加盐哈希 |
-| 传输 | 可选 HTTPS（make-cert.bat） |
+| 传输 | HTTPS（部署脚本自动签发 Let's Encrypt 正式证书） |
 | 运维 | `POST /api/admin/shutdown` + `X-Admin-Key`（data/admin.key）优雅关闭 |
 
-⚠️ `data/master.key` 丢失将无法解密已存密钥（预期行为，务必不要误删）。正式对外部署前还应加：登录限流、审计日志、数据库备份。
+⚠️ `data/master.key` 丢失将无法解密已存密钥（预期行为）。`data/` 目录已被 .gitignore 排除，永不入库。对外大规模运营前还应加：登录限流、注册邀请码、数据库备份。
 
 ## 目录结构
 
 ```
-├── start.bat            一键启动（自动装依赖）
-├── make-cert.bat        生成 HTTPS 自签名证书
-├── server.js            后端 API + HTTPS + 静态页面
-├── store.js             SQLite 数据库（含旧 JSON 自动迁移）
-├── crypto.js            AES-256-GCM 密钥加密
-├── bot-runner.js        多机器人运行器（完整指令/审查/自动攻击）
-├── audit.js             群消息审计账本
+├── deploy/
+│   ├── setup-server.sh        一键部署（Node/证书/nginx/systemd）
+│   ├── qqbot-platform.service systemd 服务模板
+│   └── nginx-vhost.conf       nginx 反代模板
+├── server.js                  后端 API + 静态页面
+├── store.js                   SQLite 数据库（含旧 JSON 自动迁移）
+├── crypto.js                  AES-256-GCM 密钥加密
+├── bot-runner.js              多机器人运行器（指令/审查/自动禁言）
+├── audit.js                   群消息审计账本
 ├── llm.js / memory.js / utils.js
-├── public/              前端（登录注册 + 管理面板）
-├── data/                db.sqlite、master.key、admin.key、certs/、audits/、memories/
-└── test-api.mjs         API 冒烟测试
+├── public/                    前端（登录注册 + 管理面板）
+├── data/                      运行时生成（库/密钥/账本，不入库）
+├── start.bat / make-cert.bat  本地开发用
+└── test-api.mjs               API 冒烟测试
 ```
 
 ## API 一览
@@ -112,10 +132,10 @@
 
 1. ~~SQLite 存储~~ ✅
 2. ~~密钥加密存储~~ ✅
-3. ~~HTTPS~~ ✅（自签名；正式证书待部署时接入）
-4. ~~完整指令 + /查违规 + 关键词自动注意（对齐单机版）~~ ✅ v0.3
-4.5 ~~自动禁言（三级力度 + 严重罪行定义）~~ ✅ v0.4
-5. 登录限流 + 审计日志 + 数据库备份
-6. 部署到云服务器（Node 24）+ 正式域名证书
+3. ~~HTTPS~~ ✅（部署脚本自动签发正式证书）
+4. ~~完整指令 + 群规审查 + 关键词自动注意~~ ✅
+5. ~~自动禁言（三级力度）~~ ✅
+6. ~~服务器一键部署（systemd + nginx + acme.sh）~~ ✅
+7. 登录限流 + 注册邀请码 + 管理员后台 + 数据库备份
 
 MIT License
