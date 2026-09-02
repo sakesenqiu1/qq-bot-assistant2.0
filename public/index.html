@@ -67,6 +67,15 @@
         <div class="field-label">群规审查</div>
         <label class="inline"><input name="autoRebuke" type="checkbox" checked> 关键词自动注意</label>
         <label>违规触发关键词（逗号分隔）<input name="keywords" type="text" placeholder="色情,黄图,约炮,裸聊,福利姬,性交,无码,艳照,色图,淫秽"></label>
+        <label class="inline"><input name="autoMuteEnabled" type="checkbox"> 自动禁言（按力度禁言违规者）</label>
+        <label>禁言力度
+          <select name="muteLevel">
+            <option value="light">轻微 —— 几乎不禁言，仅严重罪行禁言 30 分钟</option>
+            <option value="medium">中等 —— 全部禁言：一般 10 分钟 / 严重 1 小时</option>
+            <option value="heavy">重度 —— 顶格禁言：一般 1 小时 / 严重 24 小时</option>
+          </select>
+        </label>
+        <div class="hint">严重罪行定义：色情类、违法/不实信息类违规（审查定级「高」）。注意：机器人需在群内拥有管理员身份才能执行禁言，且不能禁言群主/管理员。</div>
         <label class="inline"><input name="enabled" type="checkbox" checked> 启用该机器人</label>
         <div class="modal-foot">
           <button type="submit" class="btn primary">保存</button>

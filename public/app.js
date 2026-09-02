@@ -105,7 +105,7 @@ function renderCard(b) {
     <div class="meta">
       AppID：${esc(b.qq.appId || "未填写")}${b.qq.hasSecret || b.llm.hasKey ? " · 🔒密钥已加密" : ""}<br>
       AI 模型：${esc(b.llm.model || "未填写")} · ${esc(b.llm.baseUrl || "")}<br>
-      特殊词：${b.specialWords?.length ?? 0} 条${b.moderation?.autoRebuke ? " · 🚨自动攻击开" : ""} · 更新于 ${new Date(b.updatedAt).toLocaleString("zh-CN")}
+      特殊词：${b.specialWords?.length ?? 0} 条${b.moderation?.autoRebuke ? " · 🚨自动攻击开" : ""}${b.moderation?.autoMute?.enabled ? " · 🔇禁言开" : ""} · 更新于 ${new Date(b.updatedAt).toLocaleString("zh-CN")}
     </div>
     ${b.lastError ? `<div class="err-line">⚠ ${esc(b.lastError)}</div>` : ""}
     <div class="actions">
@@ -167,6 +167,8 @@ function openModal(bot) {
   f.enabled.checked = bot ? bot.enabled : true;
   f.autoRebuke.checked = bot ? (bot.moderation?.autoRebuke !== false) : true;
   f.keywords.value = (bot?.moderation?.keywords ?? []).join(",");
+  f.autoMuteEnabled.checked = bot?.moderation?.autoMute?.enabled === true;
+  f.muteLevel.value = bot?.moderation?.autoMute?.level ?? "light";
   renderWords(bot?.specialWords ?? []);
   $("#modal").classList.remove("hidden");
 }
@@ -232,6 +234,7 @@ $("#bot-form").onsubmit = async (e) => {
   const moderation = {
     autoRebuke: f.autoRebuke.checked,
     keywords: f.keywords.value.split(/[,，、]/).map((s) => s.trim()).filter(Boolean),
+    autoMute: { enabled: f.autoMuteEnabled.checked, level: f.muteLevel.value },
   };
   const body = {
     name: f.name.value.trim(),

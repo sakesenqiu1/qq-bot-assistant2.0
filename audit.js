@@ -78,6 +78,7 @@ export class GroupAuditLog {
       user: senderName || "匿名群友#" + GroupAuditLog.hashId(senderId),
       content: text,
       at: Boolean(isAt),
+      uid: String(senderId ?? ""),
     });
     if (list.length > this.maxPerGroupPerDay) list.splice(0, list.length - this.maxPerGroupPerDay);
     this.scheduleSave();

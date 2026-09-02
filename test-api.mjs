@@ -14,14 +14,15 @@ async function call(method, path, body) {
 const log = (name, r) =>
   console.log((r.status >= 200 && r.status < 300 ? "✔" : "✘"), name, JSON.stringify(r.data).slice(0, 120));
 
-let r = await call("POST", "/api/register", { username: "测试用户", password: "test123456" });
+let r = await call("POST", "/api/register", { username: "测试用户" + Date.now().toString(36).slice(-4), password: "test123456" });
+const sameUser = r.data.username;
 token = r.data.token;
 log("注册", r);
 
-r = await call("POST", "/api/register", { username: "测试用户", password: "test123456" });
+r = await call("POST", "/api/register", { username: sameUser, password: "test123456" });
 log("重复注册(应409)", r);
 
-r = await call("POST", "/api/login", { username: "测试用户", password: "test123456" });
+r = await call("POST", "/api/login", { username: sameUser, password: "test123456" });
 log("登录", r);
 
 r = await call("GET", "/api/me");
@@ -37,7 +38,7 @@ r = await call("POST", "/api/bots", {
     { word: "群规", action: "reply", reply: "本群禁止广告、色情、刷屏。" },
     { word: "骂人", action: "ai", prompt: "用户可能涉及辱骂，请先判断其言论是否违规，若违规请严肃警告，否则正常回答。" },
   ],
-  moderation: { autoRebuke: true, keywords: ["色情", "黄图", "约炮"] },
+  moderation: { autoRebuke: true, keywords: ["色情", "黄图", "约炮"], autoMute: { enabled: true, level: "medium" } },
 });
 const botId = r.data.id;
 log("创建机器人(特殊词+审查)", r);
@@ -49,7 +50,7 @@ log("机器人列表", r);
 
 r = await call("PUT", "/api/bots/" + botId, {
   rules: "1. 禁止广告 2. 禁止辱骂",
-  moderation: { autoRebuke: false, keywords: [] },
+  moderation: { autoRebuke: false, keywords: [], autoMute: { enabled: false, level: "heavy" } },
 });
 log("更新(关闭自动攻击)", r);
 

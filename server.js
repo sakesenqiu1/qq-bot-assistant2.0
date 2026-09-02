@@ -129,6 +129,12 @@ app.post("/api/bots", auth, (req, res) => {
       enabled: req.body.moderation.enabled !== false,
       autoRebuke: req.body.moderation.autoRebuke !== false,
       cooldownMinutes: 5,
+      autoMute: {
+        enabled: req.body.moderation.autoMute?.enabled === true,
+        level: ["light", "medium", "heavy"].includes(req.body.moderation.autoMute?.level)
+          ? req.body.moderation.autoMute.level
+          : "light",
+      },
       keywords: Array.isArray(req.body.moderation.keywords)
         ? req.body.moderation.keywords.filter((k) => String(k).trim()).map((k) => String(k).trim())
         : [],
@@ -180,6 +186,12 @@ app.put("/api/bots/:id", auth, ownBot, (req, res) => {
       enabled: req.body.moderation.enabled !== false,
       autoRebuke: req.body.moderation.autoRebuke !== false,
       cooldownMinutes: 5,
+      autoMute: {
+        enabled: req.body.moderation.autoMute?.enabled === true,
+        level: ["light", "medium", "heavy"].includes(req.body.moderation.autoMute?.level)
+          ? req.body.moderation.autoMute.level
+          : "light",
+      },
       keywords: Array.isArray(req.body.moderation.keywords)
         ? req.body.moderation.keywords.filter((k) => String(k).trim()).map((k) => String(k).trim())
         : [],

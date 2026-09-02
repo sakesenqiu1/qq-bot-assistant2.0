@@ -100,8 +100,8 @@ function rowToBot(row) {
   if (!row) return null;
   let specialWords = [];
   try { specialWords = JSON.parse(row.special_words ?? "[]"); } catch {}
-  let moderation = { enabled: true, autoRebuke: true, cooldownMinutes: 5, keywords: [] };
-  try { moderation = { enabled: true, autoRebuke: true, cooldownMinutes: 5, keywords: [], ...JSON.parse(row.moderation ?? "{}") }; } catch {}
+  let moderation = { enabled: true, autoRebuke: true, cooldownMinutes: 5, keywords: [], autoMute: { enabled: false, level: "light" } };
+  try { moderation = { enabled: true, autoRebuke: true, cooldownMinutes: 5, keywords: [], autoMute: { enabled: false, level: "light" }, ...JSON.parse(row.moderation ?? "{}") }; } catch {}
   return {
     id: row.id,
     ownerId: row.owner_id,

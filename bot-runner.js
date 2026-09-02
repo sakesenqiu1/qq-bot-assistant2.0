@@ -43,6 +43,17 @@ const DEFAULT_KEYWORDS = [
   "艳照", "色图", "淫秽", "污秽", "三级片", "av资源", "av网址", "av女优", "成人网站", "性爱", "操逼", "肏", "鸡巴",
 ];
 
+// ---------------- 自动禁言配置 ----------------
+// 严重罪行定义：色情类、违法/不实信息类（或审查定级「高」）
+const MUTE_LEVELS = {
+  light: { seriousMs: 30 * 60 * 1000, generalMs: 0 },        // 轻微：几乎不禁言，仅严重罪行禁言 30 分钟
+  medium: { seriousMs: 60 * 60 * 1000, generalMs: 10 * 60 * 1000 }, // 中等：全部禁言，一般 10 分钟 / 严重 1 小时
+  heavy: { seriousMs: 24 * 60 * 60 * 1000, generalMs: 60 * 60 * 1000 }, // 重度：顶格，一般 1 小时 / 严重 24 小时
+};
+const SERIOUS_TYPES = new Set(["色情", "违法/不实信息"]);
+function isSeriousViolation(v) {
+  return Boolean(v && (SERIOUS_TYPES.has(v?.type) || v?.severity === "高"));
+}
 const REVIEWER_PROMPT = [
   "你是一个 QQ 群的「群规风纪委员」，负责审查群聊消息记录是否违规。",
   "违规类型（按严重程度排序，从严判定）：",
@@ -55,7 +66,7 @@ const REVIEWER_PROMPT = [
   "规则：",
   "- 色情、违法/不实信息一经发现，severity 一律标「高」",
   "- 只报告证据确凿的违规，模棱两可的不算",
-  "- evidence 引用原话，不超过 30 字",
+  "- evidence 必须逐字照抄消息原文，不得改写、概括或省略，不超过 30 字",
   "- 输出必须是 JSON，格式：",
   '{"violations":[{"type":"色情","user":"昵称","evidence":"原话摘要","severity":"高"}],"summary":"一句话总结"}',
   '- 没有违规时输出 {"violations":[],"summary":"今日群内未发现违规内容"}',
@@ -89,7 +100,7 @@ export function defaultBotRecord(ownerId, name = "我的机器人") {
     persona: DEFAULT_PERSONA,
     rules: "",
     specialWords: [], // [{ word, action: "reply"|"ai"|"ignore", reply?, prompt? }]
-    moderation: { enabled: true, autoRebuke: true, cooldownMinutes: 5, keywords: [...DEFAULT_KEYWORDS] },
+    moderation: { enabled: true, autoRebuke: true, cooldownMinutes: 5, keywords: [...DEFAULT_KEYWORDS], autoMute: { enabled: false, level: "light" } },
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
@@ -175,6 +186,43 @@ export async function startBot(botId) {
   const llm = new LlmClient(record.llm ?? {}, log);
   const bot = new QQBot({ appId: record.qq.appId, appSecret: record.qq.appSecret, logger: log });
   const systemPrompt = buildSystemPrompt(record);
+  const autoMute = {
+    enabled: record.moderation?.autoMute?.enabled === true,
+    level: ["light", "medium", "heavy"].includes(record.moderation?.autoMute?.level)
+      ? record.moderation.autoMute.level
+      : "light",
+  };
+  function muteDurationMs(isSerious) {
+    const lv = MUTE_LEVELS[autoMute.level] ?? MUTE_LEVELS.light;
+    return isSerious ? lv.seriousMs : lv.generalMs;
+  }
+  function formatExpire(durationMs) {
+    const d = new Date(Date.now() + durationMs + 8 * 3600 * 1000); // RFC3339，东八区
+    return d.toISOString().slice(0, 19) + "+08:00";
+  }
+  async function muteMember(groupOpenid, memberOpenid, durationMs) {
+    try {
+      await bot.api.post(`/v2/groups/${groupOpenid}/restrict_chat_setting`, {
+        members: [{ op: "add", member_openid: memberOpenid, mute_expire_at: formatExpire(durationMs) }],
+      });
+      return { ok: true, minutes: Math.round(durationMs / 60000) };
+    } catch (err) {
+      const msg = String(err?.message ?? err).slice(0, 120);
+      log.warn(`禁言失败（${memberOpenid}）：${msg}`);
+      return { ok: false, reason: msg };
+    }
+  }
+  function findEntryByEvidence(entries, evidence) {
+    const ev = String(evidence ?? "").trim();
+    if (!ev) return null;
+    for (const e of entries) {
+      if (e.content.includes(ev)) return e;
+    }
+    for (const e of entries) {
+      if (e.content.length >= 6 && ev.includes(e.content)) return e;
+    }
+    return null;
+  }
 
   const helpText = [
     `${record.name} · 指令列表`,
@@ -214,7 +262,12 @@ export async function startBot(botId) {
       const last = lastRebukeAt.get(msg.groupOpenid) ?? 0;
       if (now - last < moderation.cooldownMs) return;
       lastRebukeAt.set(msg.groupOpenid, now);
-      await safeSend(bot, msg.replyTarget, REBUKES[Math.floor(Math.random() * REBUKES.length)]);
+      let notice = "";
+      if (autoMute.enabled) {
+        const r = await muteMember(msg.groupOpenid, msg.senderId, muteDurationMs(true));
+        notice = r.ok ? "\n🔇 已禁言 " + r.minutes + " 分钟。" : "\n（禁言失败：" + String(r.reason).slice(0, 60) + "）";
+      }
+      await safeSend(bot, msg.replyTarget, REBUKES[Math.floor(Math.random() * REBUKES.length)] + notice);
     }
   });
   bot.use(messageFilter({ skipSelfEcho: true }));
@@ -366,6 +419,7 @@ export async function startBot(botId) {
     await safeSend(bot, target, `🔍 正在审查今天的 ${entries.length} 条群消息记录，稍等…`);
 
     let verdict;
+    let parsedVerdict = null;
     try {
       verdict = await llm.chat(
         [
@@ -374,20 +428,42 @@ export async function startBot(botId) {
         ],
         { signal: ctx.signal },
       );
+      const rawV = String(verdict ?? "").trim();
+      const jm = rawV.match(/\{[\s\S]*\}/);
+      if (jm) {
+        try { parsedVerdict = JSON.parse(jm[0]); } catch {}
+      }
     } catch (err) {
       log.error("群规审查失败：" + err?.message);
       await safeSend(bot, target, "审查服务出错了，请稍后再试。");
       return;
     }
 
-    const report = renderReport(verdict, entries.length, groupId);
+    // 自动禁言：按力度对违规者执行
+    const muteResults = [];
+    if (autoMute.enabled && parsedVerdict && Array.isArray(parsedVerdict.violations) && parsedVerdict.violations.length > 0) {
+      const muted = new Map(); // uid -> durationMs（同一人取最长）
+      for (const item of parsedVerdict.violations) {
+        const entry = findEntryByEvidence(entries, item?.evidence);
+        if (!entry || !entry.uid) continue;
+        const durMs = muteDurationMs(isSeriousViolation(item));
+        if (durMs <= 0) continue;
+        const prev = muted.get(entry.uid);
+        if (prev === undefined || durMs > prev) muted.set(entry.uid, durMs);
+      }
+      for (const [uid, durMs] of muted) {
+        const r = await muteMember(groupId, uid, durMs);
+        muteResults.push({ uid, durMs, ...r });
+      }
+    }
+    const report = renderReport(verdict, entries.length, groupId, muteResults, entries);
     for (const chunk of splitLongText(report, 2000)) {
       if (ctx.signal?.aborted) break;
       await safeSend(bot, target, chunk);
     }
   }
 
-  function renderReport(verdictText, totalCount, groupId) {
+  function renderReport(verdictText, totalCount, groupId, muteResults = [], entries = []) {
     let parsed = null;
     const raw = String(verdictText ?? "").trim();
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
@@ -412,6 +488,18 @@ export async function startBot(botId) {
       }
     } else {
       lines.push(raw.slice(0, 1500) || "（审查结果为空）");
+    }
+    if (muteResults.length > 0) {
+      lines.push("——————————");
+      lines.push("🔇 禁言执行结果：");
+      for (const m of muteResults) {
+        const user = entries.find((e) => e.uid === m.uid)?.user ?? "未知成员";
+        if (m.ok) {
+          lines.push(`  · ${user}：禁言 ${Math.round(m.durMs / 60000)} 分钟 ✅`);
+        } else {
+          lines.push(`  · ${user}：禁言失败（${String(m.reason).slice(0, 60)}）`);
+        }
+      }
     }
     if (audit.todayAllAt(groupId)) {
       lines.push("——————————");
