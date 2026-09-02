@@ -73,6 +73,15 @@ const REVIEWER_PROMPT = [
   '- 没有违规时输出 {"violations":[],"summary":"今日群内未发现违规内容"}',
 ].join("\n");
 
+// 构建审查提示词：内置判定标准 + 注入群主制定的「机器人规定」（群规优先，JSON 输出要求保持最后）
+function buildReviewPrompt(rulesText) {
+  if (!rulesText) return REVIEWER_PROMPT;
+  const idx = REVIEWER_PROMPT.indexOf("\n规则：\n");
+  const block = "\n## 本群机器人规定（群主制定，必须严格遵守；若与上述类型冲突，以本群规为准）\n" + rulesText;
+  if (idx < 0) return REVIEWER_PROMPT + "\n\n" + block;
+  return REVIEWER_PROMPT.slice(0, idx) + block + REVIEWER_PROMPT.slice(idx);
+}
+
 const REBUKES = [
   "喂喂喂，公共场合能不能管管自己？脑子里的黄色废料都漏出来了，这条我记小本本上了！😒",
   "啧，群规第一条：黄色内容禁止外泄。说的就是你，收敛点，再犯直接点名公示！",
@@ -236,6 +245,7 @@ export async function startBot(botId) {
   const llm = new LlmClient(record.llm ?? {}, log);
   const bot = new QQBot({ appId: record.qq.appId, appSecret: record.qq.appSecret, logger: log });
   const systemPrompt = buildSystemPrompt(record);
+  const reviewSystemPrompt = buildReviewPrompt(record.rules && String(record.rules).trim());
   const autoMute = {
     enabled: record.moderation?.autoMute?.enabled === true,
     level: ["light", "medium", "heavy"].includes(record.moderation?.autoMute?.level)
@@ -511,7 +521,7 @@ export async function startBot(botId) {
     try {
       verdict = await llm.chat(
         [
-          { role: "system", content: REVIEWER_PROMPT },
+          { role: "system", content: reviewSystemPrompt },
           { role: "user", content: `以下是今天的群聊消息记录（${recent.length} 条）：\n${recordText}` },
         ],
         { signal: ctx.signal },
@@ -616,7 +626,7 @@ export async function startBot(botId) {
       try {
         const verdict = await llm.chat(
           [
-            { role: "system", content: REVIEWER_PROMPT },
+            { role: "system", content: reviewSystemPrompt },
             { role: "user", content: `以下是最近一段时间的群聊消息记录（${entries.length} 条）：\n${recordText}` },
           ],
           {},
