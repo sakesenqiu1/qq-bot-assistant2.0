@@ -9,6 +9,7 @@
  */
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import {
   QQBot,
   errorHandler,
@@ -183,6 +184,54 @@ export async function startBot(botId) {
     maxPerGroupPerDay: 2000,
     logger: log,
   });
+  // 已处罚账本：被禁言过的言论（条目 id）不再重复处罚（保留 3 天，与审计账本同步过期）
+  const punishedFile = path.join(ROOT, "data", "mutes", botId + ".json");
+  const punishedMap = new Map(); // 条目id -> 处罚时间
+  try {
+    if (existsSync(punishedFile)) {
+      const arr = JSON.parse(readFileSync(punishedFile, "utf8"));
+      const cutoff = Date.now() - 3 * 24 * 3600 * 1000;
+      for (const item of arr ?? []) {
+        if (item && item.id && item.ts >= cutoff) punishedMap.set(String(item.id), item.ts);
+      }
+    }
+  } catch {}
+  let punishedDirty = false;
+  let punishedTimer = null;
+  function savePunished() {
+    if (!punishedDirty) return;
+    const cutoff = Date.now() - 3 * 24 * 3600 * 1000;
+    for (const [id, ts] of punishedMap) if (ts < cutoff) punishedMap.delete(id);
+    try {
+      mkdirSync(path.dirname(punishedFile), { recursive: true });
+      writeFileSync(punishedFile, JSON.stringify([...punishedMap].map(([id, ts]) => ({ id, ts }))), "utf8");
+      punishedDirty = false;
+    } catch (err) {
+      log.warn("保存禁言去重记录失败：" + err?.message);
+    }
+  }
+  function schedulePunishedSave() {
+    if (punishedTimer) clearTimeout(punishedTimer);
+    punishedTimer = setTimeout(() => savePunished(), 1500);
+    punishedTimer.unref?.();
+  }
+  function markPunished(ids) {
+    let changed = false;
+    for (const id of ids) {
+      if (id && !punishedMap.has(id)) {
+        punishedMap.set(id, Date.now());
+        changed = true;
+      }
+    }
+    if (changed) {
+      punishedDirty = true;
+      schedulePunishedSave();
+    }
+  }
+  function isPunished(id) {
+    return Boolean(id) && punishedMap.has(id);
+  }
+
   const llm = new LlmClient(record.llm ?? {}, log);
   const bot = new QQBot({ appId: record.qq.appId, appSecret: record.qq.appSecret, logger: log });
   const systemPrompt = buildSystemPrompt(record);
@@ -191,6 +240,10 @@ export async function startBot(botId) {
     level: ["light", "medium", "heavy"].includes(record.moderation?.autoMute?.level)
       ? record.moderation.autoMute.level
       : "light",
+    scanIntervalMinutes: (() => {
+      const n = Number(record.moderation?.autoMute?.scanIntervalMinutes);
+      return n >= 5 && n <= 1440 ? n : 10;
+    })(),
   };
   function muteDurationMs(isSerious) {
     const lv = MUTE_LEVELS[autoMute.level] ?? MUTE_LEVELS.light;
@@ -237,14 +290,25 @@ export async function startBot(botId) {
   ].join("\n");
 
   const lastRebukeAt = new Map(); // groupId -> ts
+  const lastMuteAt = new Map(); // `${groupId}:${uid}` -> ts（60 秒内同一人只禁言一次）
+  function canMute(groupId, uid) {
+    const key = groupId + ":" + uid;
+    const now = Date.now();
+    if (now - (lastMuteAt.get(key) ?? 0) < 60 * 1000) return false;
+    lastMuteAt.set(key, now);
+    return true;
+  }
   const lastCheckAt = new Map(); // groupId -> ts
 
   // ---- 中间件 ----
   bot.use(errorHandler({ format: (err) => `⚠️ 处理消息时出错：${String(err?.message ?? err).slice(0, 120)}` }));
+  const scanGroups = new Set();
   bot.use(async (ctx, next) => {
     const m = ctx.message;
+    let recordedEntry = null;
     if (m.kind === "group" && m.groupOpenid) {
-      audit.record(m.groupOpenid, {
+      scanGroups.add(m.groupOpenid);
+      recordedEntry = audit.record(m.groupOpenid, {
         senderId: m.senderId,
         senderName: m.senderName,
         content: m.content,
@@ -265,6 +329,7 @@ export async function startBot(botId) {
       let notice = "";
       if (autoMute.enabled) {
         const r = await muteMember(msg.groupOpenid, msg.senderId, muteDurationMs(true));
+        if (r.ok && recordedEntry?.id) markPunished([recordedEntry.id]);
         notice = r.ok ? "\n🔇 已禁言 " + r.minutes + " 分钟。" : "\n（禁言失败：" + String(r.reason).slice(0, 60) + "）";
       }
       await safeSend(bot, msg.replyTarget, REBUKES[Math.floor(Math.random() * REBUKES.length)] + notice);
@@ -442,18 +507,22 @@ export async function startBot(botId) {
     // 自动禁言：按力度对违规者执行
     const muteResults = [];
     if (autoMute.enabled && parsedVerdict && Array.isArray(parsedVerdict.violations) && parsedVerdict.violations.length > 0) {
-      const muted = new Map(); // uid -> durationMs（同一人取最长）
+      const muted = new Map(); // uid -> { durMs, ids }（同一人取最长，记录涉及的条目）
       for (const item of parsedVerdict.violations) {
         const entry = findEntryByEvidence(entries, item?.evidence);
         if (!entry || !entry.uid) continue;
+        if (isPunished(entry.id)) continue; // 该条言论已被处罚过，不再重复禁言
         const durMs = muteDurationMs(isSeriousViolation(item));
         if (durMs <= 0) continue;
         const prev = muted.get(entry.uid);
-        if (prev === undefined || durMs > prev) muted.set(entry.uid, durMs);
+        if (prev === undefined || durMs > prev.durMs) muted.set(entry.uid, { durMs, ids: [entry.id] });
+        else prev.ids.push(entry.id);
       }
-      for (const [uid, durMs] of muted) {
-        const r = await muteMember(groupId, uid, durMs);
-        muteResults.push({ uid, durMs, ...r });
+      for (const [uid, info] of muted) {
+        if (!canMute(groupId, uid)) continue; // 60 秒冷却，防并发重复
+        const r = await muteMember(groupId, uid, info.durMs);
+        if (r.ok) markPunished(info.ids);
+        muteResults.push({ uid, durMs: info.durMs, ...r });
       }
     }
     const report = renderReport(verdict, entries.length, groupId, muteResults, entries);
@@ -508,7 +577,65 @@ export async function startBot(botId) {
     return lines.join("\n");
   }
 
-  running.set(botId, { instance: bot, memory, llm, audit, status: "starting", lastError: "" });
+  // ---- 主动检查：每隔 scanIntervalMinutes 分钟审查最近消息，自动禁言新违规者 ----
+  let lastScanAt = 0;
+  let scanTimer = null;
+  async function runActiveScan() {
+    if (running.get(botId)?.status !== "running") return;
+    const now = Date.now();
+    const windowStart = lastScanAt || (now - autoMute.scanIntervalMinutes * 60 * 1000);
+    lastScanAt = now;
+    for (const groupId of scanGroups) {
+      const entries = audit.getToday(groupId).filter((e) => e.ts >= windowStart && !isPunished(e.id));
+      if (entries.length < 3) continue;
+      const recordText = entries.map((e) => `[${e.t}] ${e.user}: ${e.content}`).join("\n");
+      let parsed = null;
+      try {
+        const verdict = await llm.chat(
+          [
+            { role: "system", content: REVIEWER_PROMPT },
+            { role: "user", content: `以下是最近一段时间的群聊消息记录（${entries.length} 条）：\n${recordText}` },
+          ],
+          {},
+        );
+        const jm = String(verdict ?? "").match(/\{[\s\S]*\}/);
+        if (jm) parsed = JSON.parse(jm[0]);
+      } catch {
+        continue;
+      }
+      if (!parsed || !Array.isArray(parsed.violations) || parsed.violations.length === 0) continue;
+      const muted = new Map();
+      for (const item of parsed.violations) {
+        const entry = findEntryByEvidence(entries, item?.evidence);
+        if (!entry || !entry.uid) continue;
+        const durMs = muteDurationMs(isSeriousViolation(item));
+        if (durMs <= 0) continue;
+        const prev = muted.get(entry.uid);
+        if (prev === undefined || durMs > prev.durMs) muted.set(entry.uid, { durMs, ids: [entry.id] });
+        else prev.ids.push(entry.id);
+      }
+      for (const [uid, info] of muted) {
+        if (!canMute(groupId, uid)) continue;
+        const r = await muteMember(groupId, uid, info.durMs);
+        if (r.ok) {
+          markPunished(info.ids);
+          log.info(`主动检查：已禁言 ${uid} ${Math.round(info.durMs / 60000)} 分钟`);
+        } else {
+          log.warn(`主动检查禁言失败：${String(r.reason).slice(0, 100)}`);
+        }
+      }
+    }
+  }
+  if (autoMute.enabled && autoMute.scanIntervalMinutes >= 5) {
+    scanTimer = setInterval(
+      () => { void runActiveScan().catch((e) => log.warn("主动检查出错：" + e?.message)); },
+      autoMute.scanIntervalMinutes * 60 * 1000,
+    );
+    scanTimer.unref?.();
+    log.info(`主动检查已开启：每 ${autoMute.scanIntervalMinutes} 分钟审查一次最近消息`);
+  }
+
+  running.set(botId, { instance: bot, memory, llm, audit, scanTimer, savePunished, status: "starting", lastError: "" });
   Bots.update(botId, { status: "starting", lastError: "" });
 
   bot.start().catch((err) => {
@@ -528,8 +655,10 @@ export async function stopBot(botId) {
     return { status: "stopped" };
   }
   try { entry.instance?.stop(); } catch {}
+  if (entry.scanTimer) clearInterval(entry.scanTimer);
   entry.memory?.flush();
   entry.audit?.flush();
+  entry.savePunished?.();
   running.delete(botId);
   Bots.update(botId, { status: "stopped", lastError: "" });
   return { status: "stopped" };

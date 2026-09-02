@@ -169,6 +169,7 @@ function openModal(bot) {
   f.keywords.value = (bot?.moderation?.keywords ?? []).join(",");
   f.autoMuteEnabled.checked = bot?.moderation?.autoMute?.enabled === true;
   f.muteLevel.value = bot?.moderation?.autoMute?.level ?? "light";
+  f.scanInterval.value = bot?.moderation?.autoMute?.scanIntervalMinutes ?? 10;
   renderWords(bot?.specialWords ?? []);
   $("#modal").classList.remove("hidden");
 }
@@ -234,7 +235,7 @@ $("#bot-form").onsubmit = async (e) => {
   const moderation = {
     autoRebuke: f.autoRebuke.checked,
     keywords: f.keywords.value.split(/[,，、]/).map((s) => s.trim()).filter(Boolean),
-    autoMute: { enabled: f.autoMuteEnabled.checked, level: f.muteLevel.value },
+    autoMute: { enabled: f.autoMuteEnabled.checked, level: f.muteLevel.value, scanIntervalMinutes: Number(f.scanInterval.value) || 10 },
   };
   const body = {
     name: f.name.value.trim(),

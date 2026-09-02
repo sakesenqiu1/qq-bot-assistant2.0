@@ -72,17 +72,19 @@ export class GroupAuditLog {
       list = [];
       days.set(day, list);
     }
-    list.push({
+    const entry = {
+      id: now.toString(36) + "-" + Math.random().toString(36).slice(2, 8),
       t: GroupAuditLog.timeKey(now),
       ts: now,
       user: senderName || "匿名群友#" + GroupAuditLog.hashId(senderId),
       content: text,
       at: Boolean(isAt),
       uid: String(senderId ?? ""),
-    });
+    };
+    list.push(entry);
     if (list.length > this.maxPerGroupPerDay) list.splice(0, list.length - this.maxPerGroupPerDay);
     this.scheduleSave();
-    return true;
+    return entry;
   }
 
   /** 取某群“今天”的消息记录（按时间排序）。 */

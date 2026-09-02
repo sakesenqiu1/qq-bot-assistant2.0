@@ -75,7 +75,8 @@
             <option value="heavy">重度 —— 顶格禁言：一般 1 小时 / 严重 24 小时</option>
           </select>
         </label>
-        <div class="hint">严重罪行定义：色情类、违法/不实信息类违规（审查定级「高」）。注意：机器人需在群内拥有管理员身份才能执行禁言，且不能禁言群主/管理员。</div>
+        <label>主动检查间隔（分钟，5~1440）<input name="scanInterval" type="number" min="5" max="1440" value="10"></label>
+        <div class="hint">严重罪行定义：色情类、违法/不实信息类违规（审查定级「高」）。注意：机器人需在群内拥有管理员身份才能执行禁言，且不能禁言群主/管理员。主动检查：每隔上方的分钟数自动审查最近消息并禁言新违规者；已被处罚过的言论不会重复禁言。</div>
         <label class="inline"><input name="enabled" type="checkbox" checked> 启用该机器人</label>
         <div class="modal-foot">
           <button type="submit" class="btn primary">保存</button>

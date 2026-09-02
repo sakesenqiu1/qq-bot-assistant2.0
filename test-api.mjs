@@ -38,7 +38,7 @@ r = await call("POST", "/api/bots", {
     { word: "群规", action: "reply", reply: "本群禁止广告、色情、刷屏。" },
     { word: "骂人", action: "ai", prompt: "用户可能涉及辱骂，请先判断其言论是否违规，若违规请严肃警告，否则正常回答。" },
   ],
-  moderation: { autoRebuke: true, keywords: ["色情", "黄图", "约炮"], autoMute: { enabled: true, level: "medium" } },
+  moderation: { autoRebuke: true, keywords: ["色情", "黄图", "约炮"], autoMute: { enabled: true, level: "medium", scanIntervalMinutes: 15 } },
 });
 const botId = r.data.id;
 log("创建机器人(特殊词+审查)", r);
